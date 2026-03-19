@@ -132,8 +132,16 @@ bin
 
 # test build
 scripts/test/
+!scripts/test/txn_recovery_smoke.sh
+!scripts/test/txn_recovery_assert.sh
 upload
 export
 
 # cluster
 cluster
+
+# keep transaction recovery test scripts tracked
+!scripts/
+!scripts/test/
+!scripts/test/txn_recovery_smoke.sh
+!scripts/test/txn_recovery_assert.sh

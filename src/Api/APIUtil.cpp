@@ -844,13 +844,23 @@ bool APIUtil::insert_txn_manager(const std::string& db_name, shared_ptr<Database
         gettimeofday(&now, NULL);
         str_timeout.tv_sec = now.tv_sec + 60;
         str_timeout.tv_nsec = now.tv_usec * 1000;
-        if (pthread_rwlock_timedwrlock(&txn_m_lock, &str_timeout) == 0)
+        if (pthread_rwlock_timedwrlock(&txn_m_lock, &str_timeout) != 0)
         {
             SLOG_ERROR("add txn manager of " + db_name + " error: get wrlock timeout");
             return false;
         }
     }
     shared_ptr<Txn_manager> txn_m = make_shared<Txn_manager>(dbinfo->getDatabase().get(), db_name);
+    try
+    {
+        txn_m->restore();
+    }
+    catch (const std::exception &e)
+    {
+        SLOG_ERROR("restore txn manager of " + db_name + " failed: " + string(e.what()));
+        pthread_rwlock_unlock(&txn_m_lock);
+        return false;
+    }
     txn_managers.insert(pair<string, shared_ptr<Txn_manager>>(db_name, txn_m));
     SLOG_DEBUG("add txn manager for " + db_name + " ok");
     pthread_rwlock_unlock(&txn_m_lock);
@@ -866,7 +876,7 @@ bool APIUtil::remove_txn_manager(const std::string& db_name, bool checkpoint)
         gettimeofday(&now, NULL);
         str_timeout.tv_sec = now.tv_sec + 60;
         str_timeout.tv_nsec = now.tv_usec * 1000;
-        if (pthread_rwlock_timedwrlock(&txn_m_lock, &str_timeout) == 0)
+        if (pthread_rwlock_timedwrlock(&txn_m_lock, &str_timeout) != 0)
         {
             SLOG_ERROR("remove txn manager of " + db_name + " error: get wrlock timeout");
             return false;

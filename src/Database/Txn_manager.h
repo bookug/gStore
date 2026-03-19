@@ -7,6 +7,21 @@ written by zhangzhe
 #include "../Util/Util.h"
 #include "../Util/Latch.h"
 #include "Database.h"
+
+enum class WalType {
+	BEGIN = 0,
+	UPDATE = 1,
+	COMMIT = 2,
+	ABORT = 3,
+	CHECKPOINT = 4
+};
+
+struct WalRecord {
+	txn_id_t tid;
+	WalType type;
+	TYPE_TS ts;
+	string payload;
+};
 /*=================================================================
 STATUS:
 			Begin()            Commit()
@@ -29,6 +44,7 @@ private:
 	TYPE_TS base_ts;
 	ofstream out;
 	ofstream out_all;
+	int wal_fd;
 	
 	//naive lock table 
 	map<txn_id_t, vector<shared_ptr<Transaction> > > waiting_lists;
@@ -49,6 +65,10 @@ private:
 	
 	inline TYPE_TS ArrangeTS();
 	void writelog(string str);
+	string wal_type_to_string(WalType t) const;
+	string encode_wal(const WalRecord& rec) const;
+	bool append_wal(const WalRecord& rec, bool force_sync);
+	bool rotate_wal_after_restore(size_t parsed_lines, size_t replay_fail_cnt);
 	bool undo(string str, txn_id_t TID);
 	bool redo(string str, txn_id_t TID);
 	int Abort(txn_id_t TID);

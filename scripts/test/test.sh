@@ -31,3 +31,14 @@ echo "repeatedly insertion/deletion test num:20......"
 scripts/test/update_test 20 > /dev/null
 echo "repeatedly insertion/deletion test end"
 
+# optional txn recovery smoke test
+if [ "${RUN_TXN_RECOVERY_SMOKE:-0}" = "1" ]; then
+    echo "txn recovery smoke test start......"
+    if [ -f "scripts/test/txn_recovery_smoke.sh" ]; then
+        bash scripts/test/txn_recovery_smoke.sh
+    else
+        echo "skip: scripts/test/txn_recovery_smoke.sh not found"
+    fi
+    echo "txn recovery smoke test end"
+fi
+

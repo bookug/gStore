@@ -1,4 +1,11 @@
 #include "Txn_manager.h"
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <unistd.h>
 
 
 Txn_manager::Txn_manager(Database *db, string db_name)
@@ -9,6 +16,11 @@ Txn_manager::Txn_manager(Database *db, string db_name)
 	this->all_log_path = GlobalTypedef::db_path(db_name) + "/update_since_backup.log";
 	out.open(this->log_path.c_str(), ios::out | ios::app);
 	out_all.open(this->all_log_path.c_str(), ios::out | ios::app);
+	wal_fd = ::open(this->log_path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0644);
+	if (wal_fd < 0)
+	{
+		SLOG_ERROR("open wal failed: " << strerror(errno));
+	}
 	cnt.store(1);
 	txn_table.clear();
 	for(int i = 0; i < 3; i++)
@@ -26,6 +38,11 @@ Txn_manager::~Txn_manager()
 	txn_table.clear();
 	out.close();
 	out_all.close();
+	if (wal_fd >= 0)
+	{
+		::close(wal_fd);
+		wal_fd = -1;
+	}
 }
 
 void Txn_manager::writelog(string str)
@@ -34,6 +51,109 @@ void Txn_manager::writelog(string str)
 	out << str << endl;
 	out_all << str << endl;
 	this->unlock_log();
+}
+
+string Txn_manager::wal_type_to_string(WalType t) const
+{
+	switch (t)
+	{
+	case WalType::BEGIN:
+		return "BEGIN";
+	case WalType::UPDATE:
+		return "UPDATE";
+	case WalType::COMMIT:
+		return "COMMIT";
+	case WalType::ABORT:
+		return "ABORT";
+	case WalType::CHECKPOINT:
+		return "CHECKPOINT";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+string Txn_manager::encode_wal(const WalRecord &rec) const
+{
+	string payload = rec.payload;
+	for (auto &ch : payload)
+	{
+		if (ch == '\n' || ch == '\r' || ch == '\t')
+		{
+			ch = ' ';
+		}
+	}
+	return to_string(rec.ts) + "\t" + to_string(rec.tid) + "\t" + wal_type_to_string(rec.type) + "\t" + payload + "\n";
+}
+
+bool Txn_manager::append_wal(const WalRecord &rec, bool force_sync)
+{
+	string line = encode_wal(rec);
+	lock_guard<mutex> lk(log_lock);
+
+	if (wal_fd < 0)
+	{
+		wal_fd = ::open(this->log_path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0644);
+		if (wal_fd < 0)
+		{
+			SLOG_ERROR("open wal failed: " << strerror(errno));
+			return false;
+		}
+	}
+
+	ssize_t n = ::write(wal_fd, line.data(), line.size());
+	if (n != static_cast<ssize_t>(line.size()))
+	{
+		SLOG_ERROR("write wal failed: " << strerror(errno));
+		return false;
+	}
+
+	out_all << line;
+	out_all.flush();
+
+	if (force_sync && ::fsync(wal_fd) != 0)
+	{
+		SLOG_ERROR("fsync wal failed: " << strerror(errno));
+		return false;
+	}
+	return true;
+}
+
+bool Txn_manager::rotate_wal_after_restore(size_t parsed_lines, size_t replay_fail_cnt)
+{
+	if (parsed_lines == 0 || replay_fail_cnt > 0)
+	{
+		return false;
+	}
+
+	lock_guard<mutex> lk(log_lock);
+	if (wal_fd >= 0)
+	{
+		::close(wal_fd);
+		wal_fd = -1;
+	}
+	if (out.is_open())
+	{
+		out.close();
+	}
+
+	string archive_path = this->log_path + ".recovered." + to_string(gs::TimeUtil::timestamp());
+	if (::rename(this->log_path.c_str(), archive_path.c_str()) != 0)
+	{
+		SLOG_WARN("rotate wal failed: " << strerror(errno));
+	}
+	else
+	{
+		SLOG_INFO("rotate wal success, archived at " << archive_path);
+	}
+
+	out.open(this->log_path.c_str(), ios::out | ios::app);
+	wal_fd = ::open(this->log_path.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0644);
+	if (wal_fd < 0)
+	{
+		SLOG_ERROR("reopen wal failed: " << strerror(errno));
+		return false;
+	}
+	return true;
 }
 
 bool Txn_manager::add_transaction(txn_id_t TID, shared_ptr<Transaction> txn)
@@ -155,15 +275,19 @@ txn_id_t Txn_manager::Begin(IsolationLevelType isolationlevel)
 	shared_ptr<Transaction> txn = make_shared<Transaction>(this->db_name, gs::TimeUtil::timestamp(), TID, isolationlevel);
 	txn->SetCommitID(TID);
 	add_transaction(TID, txn);
-	string log_str = "Begin " + to_string(TID);
-	//writelog(log_str);
+	WalRecord rec{TID, WalType::BEGIN, gs::TimeUtil::timestamp(), ""};
+	if (!append_wal(rec, false))
+	{
+		txn->SetState(TransactionState::ABORTED);
+		checkpoint_lock.unlock();
+		return INVALID_ID;
+	}
 	txn->SetState(TransactionState::RUNNING);
 	return TID;
 }
 
 int Txn_manager::Commit(txn_id_t TID)
 {
-	string log_str = "Commit " + to_string(TID);
 	shared_ptr<Transaction> txn = get_transaction(TID);
 	if (txn == nullptr) {
 		SLOG_ERROR("wrong transaction id!");
@@ -177,6 +301,13 @@ int Txn_manager::Commit(txn_id_t TID)
 	}
 	txn_id_t CID = this->ArrangeCommitID();
 	txn->SetCommitID(CID);
+	WalRecord rec{TID, WalType::COMMIT, gs::TimeUtil::timestamp(), to_string(CID)};
+	if (!append_wal(rec, true))
+	{
+		txn->SetState(TransactionState::ABORTED);
+		checkpoint_lock.unlock();
+		return -2;
+	}
 	if(db != nullptr)
 		db->TransactionCommit(txn);
 	else
@@ -185,7 +316,6 @@ int Txn_manager::Commit(txn_id_t TID)
 		// checkpoint_lock.unlock();
 		return -1;
 	}
-	//writelog(log_str);
 	txn->SetState(TransactionState::COMMITTED);
 	txn->SetEndTime(gs::TimeUtil::timestamp());
 	add_dirty_keys(txn);
@@ -201,7 +331,6 @@ int Txn_manager::Commit(txn_id_t TID)
 
 int Txn_manager::Abort(txn_id_t TID)
 {
-	string log_str = "Abort " + to_string(TID);
 	shared_ptr<Transaction> txn = get_transaction(TID);
 	if (txn == nullptr) {
 		SLOG_ERROR("wrong transaction id!");
@@ -214,7 +343,8 @@ int Txn_manager::Abort(txn_id_t TID)
 		SLOG_CORE("error! database has been flushed or removed");
 		return -1;
 	}
-	//writelog(log_str);
+	WalRecord rec{TID, WalType::ABORT, gs::TimeUtil::timestamp(), ""};
+	append_wal(rec, false);
 	txn->SetState(TransactionState::ABORTED);
 	txn->SetEndTime(gs::TimeUtil::timestamp());
 	checkpoint_lock.unlock();
@@ -248,6 +378,25 @@ int Txn_manager::Query(txn_id_t TID, string sparql, string& results)
 		results = "transaction not in running state!";
 		return -99;
 	}
+	try
+	{
+		QueryTree::UpdateType update_type;
+		if (db != nullptr && db->isUpdate(sparql, update_type) && update_type != QueryTree::Not_Update)
+		{
+			WalRecord rec{TID, WalType::UPDATE, gs::TimeUtil::timestamp(), sparql};
+			if (!append_wal(rec, false))
+			{
+				txn->SetState(TransactionState::ABORTED);
+				results = "write wal update failed";
+				return -30;
+			}
+		}
+	}
+	catch (const std::exception &e)
+	{
+		SLOG_WARN("txn update detect failed: " << e.what());
+	}
+
 	int ret_val;
 	ResultSet rs;
 	FILE* output = stdout;
@@ -279,6 +428,8 @@ void Txn_manager::Checkpoint()
 {
 	SLOG_CORE("set checkpoint_lock lockExclusive begin...");
 	checkpoint_lock.lockExclusive();
+	WalRecord rec{INVALID_TID, WalType::CHECKPOINT, gs::TimeUtil::timestamp(), db_name};
+	append_wal(rec, false);
 	SLOG_CORE("set checkpoint_lock lockExclusive ok.");
 	vector<unsigned> sub_ids , obj_ids, obj_literal_ids, pre_ids;
 	sub_ids.insert(sub_ids.begin(), DirtyKeys[0].begin(), DirtyKeys[0].end());
@@ -301,38 +452,104 @@ void Txn_manager::Checkpoint()
 //TODO:this function is not complete
 void Txn_manager::restore()
 {
-	string line;
-	ifstream in;
-	in.open(this->log_path.c_str(), ios::in);
-	txn_id_t  TID = -1; //NOT COMPLETE
-	while (getline(in, line)) 
+	ifstream in(this->log_path.c_str(), ios::in);
+	if (!in.is_open())
 	{
-		if (line[0] == 'B')
+		SLOG_WARN("restore skip: can not open wal file " << this->log_path);
+		return;
+	}
+
+	vector<pair<txn_id_t, string> > update_events;
+	unordered_map<txn_id_t, bool> txn_committed;
+	size_t parsed_lines = 0;
+	size_t malformed_lines = 0;
+	string line;
+	while (getline(in, line))
+	{
+		parsed_lines++;
+		if (line.empty())
 		{
-			vector<string> redo_set;
-			while (getline(in, line))
+			continue;
+		}
+
+		vector<string> cols;
+		Util::split(line, "\t", cols);
+		if (cols.size() < 3)
+		{
+			malformed_lines++;
+			continue;
+		}
+
+		try
+		{
+			txn_id_t tid = strtoull(cols[1].c_str(), nullptr, 10);
+			const string &type = cols[2];
+			if (type == "UPDATE")
 			{
-				if (line[0] == 'B' || line[0] == 'C')
+				if (cols.size() >= 4 && !cols[3].empty())
 				{
-					break;
-				}
-				else if (line[0] == 'A')
-				{
-					if (redo_set.size() != 0)
-						continue;
-					else
-						break; //no update txn
-				}
-				else {
-					redo_set.push_back(line);
+					update_events.push_back(make_pair(tid, cols[3]));
 				}
 			}
-			for (unsigned i = 0; i < redo_set.size(); i++)
+			else if (type == "COMMIT")
 			{
-				redo(redo_set[i], TID);
+				txn_committed[tid] = true;
+			}
+			else if (type == "ABORT")
+			{
+				txn_committed[tid] = false;
 			}
 		}
+		catch (const std::exception &e)
+		{
+			malformed_lines++;
+			SLOG_WARN("restore parse wal line failed: " << e.what());
+		}
 	}
+
+	if (db == nullptr)
+	{
+		SLOG_ERROR("restore failed: database pointer is null");
+		return;
+	}
+
+	size_t replay_cnt = 0;
+	size_t replay_fail_cnt = 0;
+	for (const auto &event : update_events)
+	{
+		txn_id_t tid = event.first;
+		auto state_it = txn_committed.find(tid);
+		if (state_it == txn_committed.end() || state_it->second == false)
+		{
+			continue;
+		}
+		const string &sparql = event.second;
+		try
+		{
+			ResultSet rs;
+			int ret = db->query(sparql, rs, nullptr, true, false, nullptr);
+			if (ret < 0)
+			{
+				replay_fail_cnt++;
+				SLOG_WARN("restore replay update failed, tid=" << tid << ", ret=" << ret);
+			}
+			else
+			{
+				replay_cnt++;
+			}
+		}
+		catch (const std::exception &e)
+		{
+			replay_fail_cnt++;
+			SLOG_WARN("restore replay update exception, tid=" << tid << ", msg=" << e.what());
+		}
+	}
+	SLOG_INFO("restore finished for db=" << db_name
+			  << ", wal_lines=" << parsed_lines
+			  << ", malformed_lines=" << malformed_lines
+			  << ", replayed_updates=" << replay_cnt
+			  << ", replay_failed=" << replay_fail_cnt);
+	rotate_wal_after_restore(parsed_lines, replay_fail_cnt);
 }
 
 txn_id_t Txn_manager::find_latest_txn()
